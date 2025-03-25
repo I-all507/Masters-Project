@@ -13,7 +13,7 @@ gamma=np.euler_gamma
 class NSBH():
     type = 'Neutron Star Black Hole binary'
 
-    def __init__(self, system_params, z, detector, newtonian=False):
+    def __init__(self, system_params, z, detector, newtonian=False, step_sizes=np.array([2.23609501e-08, 7.54036265e-10, 4.98486137e-10, 2.72851102e-09, 6.30825767e-09, 2.25155432e-04])):
         ''' Initialisation function. Establishes the source frame properties of the system
             and stores the redshift for transformation at a later point.
             system_params: 1d array of properties, in the following order:
@@ -23,27 +23,47 @@ class NSBH():
                 phi, theta: RA, dec of source location on sky;
                 iota: angle between line of sight and sysmtem's orb.ang.mom;
                 psi: polarisation angle of GWs;
-                t_c: coordinate time of coalescence;
-                phi_c: phase at coalescence;
                 EOS: the neutron star EOS equation used to model deformability (assumed to be known without error);
-                z: redshift of signal;
-            newtonian: a flag to say when PN terms (and tidal effects) are being considered;'''
+            z: redshift of signal;
+            newtonian: a flag to say when PN terms (and tidal effects) are being considered;
+            step_sizes: used for finite differencing. Defaults to those used in study, but can be varied for optimisation purposes.'''
         
-        m_BH, m_NS, r, phi, theta, iota, psi, t_c, phi_c, EOS = system_params
+        m_BH, m_NS, r, phi, theta, iota, psi, EOS = system_params
         self.h_A, self.h_M, self.h_t, self.h_phi, self.h_eta, self.h_z = np.zeros(6) #finite differencing values
         self.m_BH = m_BH * Msol #source-frame m_BH
         self.m_NS = m_NS * Msol #source-frame m_NS
         self.Mc = (m_BH + m_NS)*((m_BH*m_NS)/((m_BH + m_NS)**2))**(3/5) * Msol #source-frame chirp mass
         self.r = r * Mpc #proper distance
-        self.t_c = t_c
-        self.phi_c = phi_c
+        self.t_c = 6 ## this parameter is arbitrary, set to 6 as this was the value optimisation was performed with
+        self.phi_c = 0.1 ## this parameter is arbitrary, set to 0.1 as this was the value optimisation was performed with
         self.z = z
         self.detector = detector
+        self.steps = step_sizes
         
         def IFO(detector=detector, theta=theta, phi=phi, psi=psi, iota=iota):
             
+            def THETA(source_loc,detector_loc):
+                ##function to convert sky (ra,dec) into the relative detector declination
+                ra_s, dec_s = source_loc
+                ra_d, dec_d = detector_loc
+                return np.arccos(np.cos(dec_d)*np.cos(dec_s)*np.cos(ra_s - ra_d) + np.sin(dec_d)*np.sin(dec_s))
+            
+            def PHI(source_loc, detector_loc):
+                ##function to convert sky (ra,dec) into the relative detector right ascension
+                ra_s, dec_s = source_loc
+                ra_d, dec_d = detector_loc
+            
+                arm_vec = np.array([1,0])
+                rel_source_vec = np.array([ra_s-ra_d,dec_s-dec_d])
+                abs = np.sqrt(np.dot(rel_source_vec,rel_source_vec))
+                dot = np.dot(arm_vec,rel_source_vec)
+                if abs == 0:
+                    return 0
+                else:
+                    return np.arccos(dot/abs)
+
+                
             def ET_IFO(theta, phi, psi, iota):
-                #assume coords are the tripoint of Belgium, Netherlands and Germany 
                 def plus(theta, phi, psi):
                     return -np.sqrt(3)/4*((1+np.cos(theta)**2)*np.sin(2*phi)*np.cos(2*psi) + 2*np.cos(theta)*np.cos(2*phi)*np.sin(2*psi))
                 def cross(theta, phi, psi):
@@ -54,18 +74,19 @@ class NSBH():
                 return sum
 
             def CE_IFO(theta, phi, psi, iota):
-                #assume same coords as LIGO Livinston: 30°33'46.3"N 90°46'29.1"W
                 def plus(theta, phi, psi):
                     return 0.5*(1+np.cos(theta)**2)*np.cos(2*phi)*np.cos(2*psi) -np.cos(theta)*np.sin(2*phi)*np.sin(2*psi)
                 def cross(theta, phi, psi):
-                    return 0.5*(1+np.cos(theta)**2)*np.cos(2*phi)*np.sin(2*psi) -np.cos(theta)*np.sin(2*phi)*np.cos(2*psi)
+                    return 0.5*(1+np.cos(theta)**2)*np.cos(2*phi)*np.sin(2*psi) +np.cos(theta)*np.sin(2*phi)*np.cos(2*psi)
                 sum = 0.25*(1+np.cos(iota)**2)**2*plus(theta,phi,psi)**2 + np.cos(iota)**2*cross(theta,phi,psi)**2
                 return sum
 
             if detector == 'ET':
-                angle_func = ET_IFO(theta=theta, phi=phi, psi=psi, iota=iota)
+                loc = np.array([10.424*np.pi/180, 43.631*np.pi/180])
+                angle_func = ET_IFO(theta=THETA([phi,theta],loc), phi=PHI([phi,theta],loc), psi=psi, iota=iota)
             elif detector == 'CE':
-                angle_func = CE_IFO(theta=theta, phi=phi, psi=psi, iota=iota)
+                loc = np.array([(-112.825+360)*np.pi/180, 43.827*np.pi/180])
+                angle_func = CE_IFO(theta=THETA([phi,theta],loc), phi=PHI([phi,theta],loc), psi=psi, iota=iota)
             else:
                 raise Exception('Valid detectors are: ET, CE')
             return np.sqrt(angle_func)
@@ -207,7 +228,7 @@ class NSBH():
         '''Computes the GW waveform for each frequency in a given array.
         The only argument of concern is tidal_flag. False indicates that tidal contributions are considered
             whilst True returns a tidal contribution of 0.'''
-        return self.prefactor()* frequency**(-7/6) * np.e**(-im * self.wave_phase(frequency,tidal_flag=tidal_flag)) #*(1+self.redshift())**(-1/6)
+        return self.prefactor()* frequency**(-7/6) * np.e**(-im * self.wave_phase(frequency,tidal_flag=tidal_flag))
 
     
     def get_PSD_data(self):
@@ -234,41 +255,50 @@ class NSBH():
     def get_central_diff(self, diff_param, frequency):
         def get_difference_param(diff_param):
             '''Returns the parameter that is being differentiated without finite difference perturbation. Necessary as a consequence of how 
-                I have implemented numerical differentiation (see mathtools).'''
+                I have implemented numerical differentiation.'''
             index = np.where(np.abs(diff_param) > 0)[0][0]
-            difference_params = [self.prefactor()/(1+sum(diff_param)), self.chirp_mass()/(1+sum(diff_param)),
-                                 self.t_coalescence()/(1+sum(diff_param)), self.phi_coalescence()/(1+sum(diff_param)),
-                                 self.symm_mass()/(1+sum(diff_param)), self.redshift()/(1+sum(diff_param)) ]
+            difference_params = [self.prefactor(), self.chirp_mass(),
+                                 self.t_coalescence(), self.phi_coalescence(),
+                                 self.symm_mass(), self.redshift()]
             return difference_params[index]
-    
-        self.h_A, self.h_M, self.h_t, self.h_phi, self.h_eta, self.h_z = diff_param
+
         param = get_difference_param(diff_param=diff_param)
+        
+        self.h_A, self.h_M, self.h_t, self.h_phi, self.h_eta, self.h_z = diff_param
         difference_plus = self.waveform(frequency)
+        
         self.h_A, self.h_M, self.h_t, self.h_phi, self.h_eta, self.h_z = -diff_param
         difference_minus = self.waveform(frequency)
+        
         self.h_A, self.h_M, self.h_t, self.h_phi, self.h_eta, self.h_z = np.zeros(6)
         partial = (difference_plus - difference_minus)/(2*np.sum(diff_param)*param)
+        
         return partial
         
         
     def get_lower_diff(self, diff_param, frequency):
         def get_difference_param(diff_param):
             '''Returns the parameter that is being differentiated without finite difference perturbation. Necessary as a consequence of how 
-                I have implemented numerical differentiation (see mathtools).'''
+                I have implemented numerical differentiation.'''
             index = np.where(np.abs(diff_param) > 0)[0][0]
-            difference_params = [self.prefactor()/(1+sum(diff_param)), self.chirp_mass()/(1+sum(diff_param)),
-                                 self.t_coalescence()/(1+sum(diff_param)), self.phi_coalescence()/(1+sum(diff_param)),
-                                 self.symm_mass()/(1+sum(diff_param)), self.redshift()/(1+sum(diff_param)) ]
+            difference_params = [self.prefactor(), self.chirp_mass(),
+                                 self.t_coalescence(), self.phi_coalescence(),
+                                 self.symm_mass(), self.redshift()]
             return difference_params[index]
-        regular = self.waveform(frequency)
-        self.h_A, self.h_M, self.h_t, self.h_phi, self.h_eta, self.h_z = diff_param
+
         param = get_difference_param(diff_param=diff_param)
+        
+        regular = self.waveform(frequency)
+        
+        self.h_A, self.h_M, self.h_t, self.h_phi, self.h_eta, self.h_z = -diff_param
         difference_minus = self.waveform(frequency)
+
+        self.h_A, self.h_M, self.h_t, self.h_phi, self.h_eta, self.h_z = np.zeros(6)
         partial = (regular - difference_minus)/(np.sum(diff_param)*param)
         return partial   
 
 
-    def get_FIM(self, h = np.array([2.58018538e-10, 6.03984370e-09, 5.04281128e-09, 1e-9, 1.90511631e-9, 2e-6])):
+    def get_FIM(self):
         '''Function to compute and return the Fisher information matrix.
         h: the finite difference vector for computation as found through optimisation for a [5.08,1] NSBH.'''
         def inner_product(fnc_i, fnc_j, PSD, frequency):
@@ -276,7 +306,7 @@ class NSBH():
             inner_prod = trapezoid(y=integrand, x=frequency)
             return inner_prod
             
-        h1,h2,h3,h4,h5,h6 = h
+        h1,h2,h3,h4,h5,h6 = self.steps
         H_A   = np.array([h1,0,0,0,0,0])
         H_M   = np.array([0,h2,0,0,0,0])
         H_t   = np.array([0,0,h3,0,0,0])
@@ -312,7 +342,7 @@ class NSBH():
             integrand = 2 * (np.conjugate(fnc_i)*fnc_j + fnc_i*np.conjugate(fnc_j))/psd
             return np.real(trapezoid(y=integrand,x=f)/self.SNR()**2)
         else:
-            return (trapezoid(system.wave_phase(f,tidal_flag=True),f)-trapezoid(system.wave_phase(f,tidal_flag=False),f))/2/np.pi
+            return (trapezoid(self.wave_phase(f,tidal_flag=True),f)-trapezoid(self.wave_phase(f,tidal_flag=False),f))/2/np.pi
 
 
 class BNS():
